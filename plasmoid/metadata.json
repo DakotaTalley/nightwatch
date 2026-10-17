@@ -1,0 +1,19 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Dakota Talley"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "Dim and warm one monitor for watching in bed, with a sleep cutoff",
+        "EnabledByDefault": true,
+        "Icon": "redshift-status-on",
+        "Id": "com.dakotatalley.nightwatch",
+        "License": "MIT",
+        "Name": "Night Viewing",
+        "Version": "2.1"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

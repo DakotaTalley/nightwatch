@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# Bed-viewing mode: dim and warm one monitor for watching in the dark, and make
+# sure nothing sits lit all night if you fall asleep.
+#
+# The real problem this solves: any video player holds a Wayland idle inhibitor
+# while it plays, so PowerDevil's dim and display-off timers never fire during
+# a movie. Fall asleep mid-episode and every screen stays lit until morning.
+# `on` arms its own cutoff: it pauses playback, which drops the inhibitor, then
+# blanks the outputs. After that the normal timers work again.
+#
+#   nightwatch [opts] on [2h] [2000] [4]  dim + warm, arm the cutoff (dur, kelvin, %)
+#   nightwatch off                        restore day settings, cancel the cutoff
+#   nightwatch [opts] toggle [...]        on if off, off if on
+#   nightwatch extend [30m]               push the cutoff further out, keeping the rest
+#   nightwatch now                        run the cutoff immediately
+#   nightwatch status / state             human-readable / machine-readable
+#   nightwatch displays                   connected monitors, one per line (for the widget)
+#
+# Options, before the command:
+#   --display CONNECTOR   the monitor you watch on, e.g. HDMI-A-1 (default: auto,
+#                         the first connected monitor). See `nightwatch status`.
+#   --others dim|leave    turn every other monitor down to 0% (default) or leave it
+# NIGHTWATCH_DISPLAY / NIGHTWATCH_OTHERS set the same defaults.
+#
+# Pass `none` as the duration for no cutoff. Monitors are identified by
+# connector (HDMI-A-1, DP-3, ...), which stays unique even with two identical
+# models. Brightness goes through KWin (kscreen-doctor), which drives DDC/CI.
+set -uo pipefail
+
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/nightwatch
+# Counts failed PowerDevil restarts. Lives in the runtime dir, so it resets at
+# every login.
+HEAL=${XDG_RUNTIME_DIR:-/tmp}/nightwatch-heal-failures
+HEAL_MAX=2
+WATCH_SEL=${NIGHTWATCH_DISPLAY:-auto}
+OTHERS=${NIGHTWATCH_OTHERS:-dim}
+SELF=$(readlink -f "$0")
+# Run ourselves through bash explicitly: a .plasmoid install unpacks from a zip
+# and the executable bit is not guaranteed to survive.
+RUN_SELF=("$BASH" "$SELF")
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    --display)   WATCH_SEL=${2:?--display needs a connector}; shift 2 ;;
+    --display=*) WATCH_SEL=${1#*=}; shift ;;
+    --others)    OTHERS=${2:?--others needs dim or leave}; shift 2 ;;
+    --others=*)  OTHERS=${1#*=}; shift ;;
+    *) break ;;
+  esac
+done
+[ -n "$WATCH_SEL" ] || WATCH_SEL=auto
+case $OTHERS in dim|leave) ;; *) echo "--others must be dim or leave" >&2; exit 2 ;; esac
+
+# ---- monitors ---------------------------------------------------------------
+# One line per connected, enabled monitor:
+#   connector <TAB> brightness-controllable (1/0) <TAB> percent <TAB> model name
+# The model name comes from the EDID, since KWin's output list doesn't carry it.
+outputs_raw() {
+  python3 -I - <<'EOF'
+import glob, json, re, subprocess
+def run(*a):
+    return subprocess.run(a, capture_output=True, text=True).stdout
+try:
+    outs = json.loads(run("kscreen-doctor", "-j")).get("outputs", [])
+except ValueError:
+    outs = []
+supported, cur = {}, None
+for line in re.sub(r"\x1b\[[0-9;]*m", "", run("kscreen-doctor", "-o")).splitlines():
+    m = re.match(r"Output: \d+ (\S+)", line)
+    if m:
+        cur = m.group(1)
+    elif cur and "Brightness control:" in line:
+        supported[cur] = "unsupported" not in line
+def model(conn):
+    for p in glob.glob(f"/sys/class/drm/card*-{conn}/edid"):
+        try:
+            e = open(p, "rb").read()
+        except OSError:
+            continue
+        for i in range(54, 126, 18):
+            d = e[i:i + 18]
+            if len(d) == 18 and d[:3] == b"\0\0\0" and d[3] == 0xFC:
+                return d[5:].split(b"\n")[0].decode("ascii", "replace").strip()
+    return ""
+for o in outs:
+    if not (o.get("connected") and o.get("enabled")):
+        continue
+    n = o["name"]; ok = supported.get(n, False)
+    pct = round(o.get("brightness", 0) * 100) if ok else ""
+    print(f"{n}\t{int(ok)}\t{pct}\t{model(n) or n}")
+EOF
+}
+OUT=""
+load_outputs() { OUT=$(outputs_raw); }
+row()      { awk -F'\t' -v c="$1" '$1==c' <<<"$OUT"; }
+can_dim()  { [ "$(row "$1" | cut -f2)" = 1 ]; }
+pct_of()   { row "$1" | cut -f3; }
+name_of()  { local n; n=$(row "$1" | cut -f4); echo "${n:-$1}"; }
+
+resolve_watch() {
+  local c=$WATCH_SEL
+  [ "$c" = auto ] && c=$(head -n1 <<<"$OUT" | cut -f1)
+  [ -n "$c" ] || { echo "  no monitors found" >&2; return 1; }
+  echo "$c"
+}
+
+# PowerDevil can miss a monitor at startup (always so when ddcutilrc has
+# --disable-watch-displays, a common fix for monitor wake loops), and KWin can only set
+# brightness on displays PowerDevil has registered. So "connected but no
+# brightness control" means PowerDevil missed it: restart PowerDevil and wait.
+# Monitors that are simply not connected never trigger this, and after
+# $HEAL_MAX failed restarts in one login it stops trying.
+heal() {
+  local c=$1 n i
+  n=$(cat "$HEAL" 2>/dev/null || echo 0)
+  [ "$n" -ge "$HEAL_MAX" ] 2>/dev/null && return 1
+  if systemctl --user restart plasma-powerdevil.service 2>/dev/null; then
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      sleep 1; load_outputs
+      can_dim "$c" && { rm -f "$HEAL"; return 0; }
+    done
+  fi
+  echo $(( n + 1 )) > "$HEAL"; return 1
+}
+ensure_dimmable() {
+  local c=$1
+  [ -n "$(row "$c")" ] || { echo "  $c is not connected" >&2; return 1; }
+  can_dim "$c" && { rm -f "$HEAL"; return 0; }
+  heal "$c" && return 0
+  echo "  $c has no brightness control (PowerDevil has not registered it)" >&2
+  return 1
+}
+
+# set_brightness CONNECTOR=PCT ... - one kscreen-doctor call for all of them
+set_brightness() {
+  local args=() kv
+  for kv in "$@"; do args+=("output.${kv%%=*}.brightness.${kv#*=}"); done
+  [ ${#args[@]} -gt 0 ] && kscreen-doctor "${args[@]}" >/dev/null 2>&1
+}
+
+nl_read() { kreadconfig6 --file kwinrc --group NightColor --key "$1" --default "$2"; }
+nl_write(){ kwriteconfig6 --file kwinrc --notify --group NightColor --key "$1" ${3:+--type "$3"} "$2"; }
+
+secs_left() {
+  [ -f "$STATE" ] || { echo -1; return; }
+  local d; d=$(. "$STATE"; echo "${DEADLINE:-0}")
+  [ "$d" -gt 0 ] 2>/dev/null || { echo -1; return; }
+  local l=$(( d - $(date +%s) )); [ $l -lt 0 ] && l=0; echo $l
+}
+
+nw_on() {
+  local dur=${1:-2h} temp=${2:-2000} pct=${3:-4} watch deadline=0
+  load_outputs
+  watch=$(resolve_watch) || exit 1
+  ensure_dimmable "$watch" || exit 1
+
+  systemctl --user stop nightwatch-cutoff.timer 2>/dev/null
+  if [ "$dur" != none ]; then
+    local us; us=$(systemd-analyze timespan "$dur" 2>/dev/null | awk '/μs:/{print $2}')
+    [ -n "$us" ] || { echo "bad duration: $dur"; exit 1; }
+    deadline=$(( $(date +%s) + us / 1000000 ))
+    systemd-run --user --on-active="$dur" --unit=nightwatch-cutoff \
+      --description="nightwatch cutoff" \
+      "${RUN_SELF[@]}" now >/dev/null 2>&1
+  fi
+
+  # Re-applying while already on (the widget changing warmth or cutoff) must
+  # keep the ORIGINAL restore point - otherwise it would save the already-dimmed
+  # values as "day" and `off` would restore nothing.
+  local restore nl_a nl_m nl_t
+  if [ -f "$STATE" ]; then
+    . "$STATE"
+    restore=${RESTORE:-}
+    nl_a=$NL_ACTIVE; nl_m=$NL_MODE; nl_t=$NL_TEMP
+  else
+    restore=$(awk -F'\t' '$2==1{printf "%s%s=%s", s, $1, $3; s=" "}' <<<"$OUT")
+    nl_a=$(nl_read Active false); nl_m=$(nl_read Mode DarkLight)
+    nl_t=$(nl_read NightTemperature 4500)
+  fi
+
+  mkdir -p "$(dirname "$STATE")"
+  { echo "WATCH=$watch"
+    echo "RESTORE=\"$restore\""
+    echo "NL_ACTIVE=$nl_a"
+    echo "NL_MODE=$nl_m"
+    echo "NL_TEMP=$nl_t"
+    echo "DEADLINE=$deadline"
+    echo "SET_TEMP=$temp"
+    echo "SET_PCT=$pct"
+  } > "$STATE"
+
+  local set=("$watch=$pct") c
+  if [ "$OTHERS" = dim ]; then
+    for c in $(awk -F'\t' -v w="$watch" '$2==1 && $1!=w{print $1}' <<<"$OUT"); do
+      set+=("$c=0")
+    done
+  fi
+  set_brightness "${set[@]}"
+  nl_write NightTemperature "$temp"
+  nl_write Mode Constant
+  nl_write Active true bool
+}
+
+nw_off() {
+  systemctl --user stop nightwatch-cutoff.timer 2>/dev/null
+  if [ -f "$STATE" ]; then
+    . "$STATE"
+    load_outputs
+    [ -n "${WATCH:-}" ] && ! can_dim "$WATCH" && [ -n "$(row "$WATCH")" ] && heal "$WATCH"
+    # restore only monitors that are still here and controllable
+    local back=() kv
+    for kv in ${RESTORE:-}; do
+      can_dim "${kv%%=*}" && [ -n "${kv#*=}" ] && back+=("$kv")
+    done
+    set_brightness "${back[@]}"
+    nl_write NightTemperature "${NL_TEMP:-4500}"
+    nl_write Mode "${NL_MODE:-DarkLight}"
+    nl_write Active "${NL_ACTIVE:-false}" bool
+    rm -f "$STATE"
+  fi
+  kscreen-doctor --dpms on >/dev/null 2>&1
+}
+
+case "${1:-status}" in
+
+on)     nw_on "${2:-2h}" "${3:-2000}" "${4:-4}"
+        . "$STATE"; l=$(secs_left)
+        printf '  %s (%s) at %s%%, %sK  |  others %s  |  %s\n' \
+          "$(name_of "$WATCH")" "$WATCH" "${4:-4}" "${3:-2000}" \
+          "$([ "$OTHERS" = dim ] && echo "at 0%" || echo "left as is")" \
+          "$([ "$l" -lt 0 ] && echo "no cutoff" || echo "cutoff in $((l/60)) min")" ;;
+
+off)    nw_off; echo "  restored." ;;
+
+toggle) if [ -f "$STATE" ]; then nw_off; echo off
+        else nw_on "${2:-2h}" "${3:-2000}" "${4:-4}"; echo on; fi ;;
+
+extend)
+  # Push the cutoff further out without disturbing anything else. Extends the
+  # existing deadline, not "N from now" - a 10-minute-old 2h timer plus 30m
+  # leaves 1h50m, so repeated taps accumulate the way you would expect.
+  [ -f "$STATE" ] || { echo "  night viewing is off"; exit 1; }
+  us=$(systemd-analyze timespan "${2:-30m}" 2>/dev/null | awk '/μs:/{print $2}')
+  [ -n "$us" ] || { echo "bad duration: ${2:-30m}"; exit 1; }
+  . "$STATE"
+  now=$(date +%s); base=${DEADLINE:-0}
+  [ "$base" -le "$now" ] && base=$now      # also covers DEADLINE=0, i.e. no cutoff yet
+  new=$(( base + us / 1000000 ))
+  systemctl --user stop nightwatch-cutoff.timer 2>/dev/null
+  systemd-run --user --on-active="$(( new - now ))s" --unit=nightwatch-cutoff \
+    --description="nightwatch cutoff" "${RUN_SELF[@]}" now >/dev/null 2>&1
+  sed -i "s/^DEADLINE=.*/DEADLINE=$new/" "$STATE"
+  echo "  cutoff in $(( (new - now) / 60 )) min" ;;
+
+now)
+  # Pause anything on MPRIS (Haruna, Firefox, VLC...). Pausing is what releases
+  # the idle inhibitor - blanking alone would just get undone by the player.
+  for n in $(busctl --user list --no-legend 2>/dev/null | awk '/^org\.mpris\.MediaPlayer2\./{print $1}'); do
+    busctl --user call "$n" /org/mpris/MediaPlayer2 \
+      org.mpris.MediaPlayer2.Player Pause >/dev/null 2>&1 && echo "  paused $n"
+  done
+  sleep 2
+  kscreen-doctor --dpms off >/dev/null 2>&1 ;;
+
+state)
+  # one line, key=value, for the widget. Never heals: the widget polls this.
+  load_outputs
+  a=0; w=""
+  [ -f "$STATE" ] && { a=1; w=$(. "$STATE"; echo "${WATCH:-}"); }
+  [ -n "$w" ] || w=$(resolve_watch 2>/dev/null)
+  p=$(pct_of "$w")
+  printf 'active=%s left=%s temp=%s pct=%s display=%s\n' "$a" "$(secs_left)" \
+    "$(nl_read NightTemperature 4500)" "${p:-0}" "$w" ;;
+
+displays)
+  # connector <TAB> brightness-controllable <TAB> model, for the widget settings
+  load_outputs
+  cut -f1,2,4 <<<"$OUT" ;;
+
+status)
+  load_outputs
+  w=$(resolve_watch 2>/dev/null)
+  [ -f "$STATE" ] && w=$(. "$STATE"; echo "${WATCH:-$w}")
+  while IFS=$'\t' read -r c ok p n; do
+    [ -n "$c" ] || continue
+    printf '  %s %-10s %-14s %s\n' "$([ "$c" = "$w" ] && echo '*' || echo ' ')" "$c" "$n" \
+      "$([ "$ok" = 1 ] && echo "$p%" || echo "no brightness control")"
+  done <<<"$OUT"
+  printf "  night light  %s, %s, %sK\n" "$(nl_read Active false)" \
+    "$(nl_read Mode DarkLight)" "$(nl_read NightTemperature 4500)"
+  s=$(secs_left); [ "$s" -ge 0 ] && printf "  cutoff in    %s min\n" "$((s/60))"; : ;;
+
+*) sed -n '2,26p' "$SELF" | sed 's/^# \?//' ;;
+esac
